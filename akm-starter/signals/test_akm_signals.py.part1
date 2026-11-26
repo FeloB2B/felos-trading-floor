@@ -1,0 +1,86 @@
+import concurrent.futures
+import copy
+import json
+import os
+import sqlite3
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+
+import akm_signals as akm
+
+ROOT = Path(__file__).resolve().parent
+SECRET = "s" * 40  # Test fixture only; not a credential.
+
+
+class SignalTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "rules.json"
+        self.db = Path(self.tmp.name) / "dedupe.sqlite"
+        self.template = json.loads((ROOT / "shared_rules.template.json").read_text(encoding="utf-8"))
+        self.cfg = copy.deepcopy(self.template)
+        self.cfg["status"] = "configured"
+        self.cfg["known_instruments"] = ["TEST_A", "TEST_B", "TEST_C"]
+        self.cfg["proposed_instruments"] = ["TEST_D"]
+        self.cfg["approved_instruments"] = ["TEST_A", "TEST_B", "TEST_D"]
+        self.cfg["timeframes"] = ["15m", "1h", "4h", "1d"]
+        self.write_cfg()
+        self.rules = akm.load_rules(self.path)
+        self.event = {"secret": SECRET, "event_id": "alert-123", "strategy": "example", "symbol": "TEST_A", "timeframe": "15m", "direction": "long", "observed_at": "2026-11-26T10:00:00+02:00"}
+
+    def write_cfg(self):
+        self.path.write_text(json.dumps(self.cfg), encoding="utf-8")
+
+    def call(self, obj=None, body=None, secret=SECRET, db=None, rules=None):
+        if body is None:
+            body = json.dumps(self.event if obj is None else obj).encode()
+        return akm.intake(body, server_secret=secret, rules=rules or self.rules, dedupe_db=self.db if db is None else db)
+
+    def rejects(self, obj=None, code="invalid_request", **kwargs):
+        with self.assertRaises(akm.IntakeError) as ctx:
+            self.call(obj, **kwargs)
+        self.assertEqual(ctx.exception.code, code)
+        self.assertNotIn(SECRET, str(ctx.exception))
+
+    def test_template_fails_closed_and_explicit_proposed(self):
+        with self.assertRaises(akm.ConfigurationError):
+            akm.load_rules(ROOT / "shared_rules.template.json")
+        self.assertEqual(self.template["known_instruments"], [])
+        self.assertEqual(self.template["proposed_instruments"], [])
+        self.assertEqual(self.template["approved_instruments"], [])
+        self.assertEqual(self.template["timeframes"], [])
+
+    def test_config_fails_closed(self):
+        for key, value in [("status", "unconfigured"), ("mode", "automatic"), ("model_validation", "validated"),
+                           ("approved_instruments", []), ("approved_instruments", ["UNKNOWN"]),
+                           ("approved_instruments", ["TEST_A", "TEST_A"]), ("timeframes", ["invalid"])]:
+            with self.subTest(key=key, value=value):
+                old = self.cfg[key]
+                self.cfg[key] = value
+                self.write_cfg()
+                with self.assertRaises(akm.ConfigurationError):
+                    akm.load_rules(self.path)
+                self.cfg[key] = old
+        self.path.write_text('{"status":"configured","status":"configured"}', encoding="utf-8")
+        with self.assertRaises(akm.ConfigurationError):
+            akm.load_rules(self.path)
+        with self.assertRaises(akm.ConfigurationError):
+            akm.load_rules(self.path.parent / "missing.json")
+
+    def test_secret_required_and_environment(self):
+        for val in ("", "x" * 31, " " * 40, None, "x" * 257):
+            with self.subTest(val=val), self.assertRaises(akm.ConfigurationError):
+                self.call(secret=val)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(akm.ConfigurationError):
+                akm.secret_from_env()
+        with mock.patch.dict(os.environ, {"AKM_WEBHOOK_SECRET": SECRET}):
+            self.assertEqual(akm.secret_from_env(), SECRET)
+
+    def test_unauthorized_no_dedupe(self):
+        for val in (None, "", "wrong", 12, [SECRET]):
+            with self.subTest(val=val):
+  
