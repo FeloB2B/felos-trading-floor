@@ -1,0 +1,95 @@
+"""Offline manual trade journal. SQLite stores user-entered data, never broker access."""
+from __future__ import annotations
+
+import argparse
+import calendar
+import datetime as dt
+from decimal import Decimal, localcontext
+import json
+import re
+import sqlite3
+import sys
+
+SCHEMA_VERSION = 1
+DISCLAIMER = ('Descriptive arithmetic on manually entered records only; not investment advice. '
+              'No risk limit, trade signal, broker reconciliation or execution is provided.')
+NUMBER = re.compile(r'^[+-]?(?:0|[1-9][0-9]{0,17})(?:\.[0-9]{1,8})?$')
+DATE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+CURRENCY = re.compile(r'^[A-Z]{3}$')
+FIELDS = {'opened_date', 'closed_date', 'symbol', 'direction', 'currency',
+          'realized_pnl', 'planned_risk', 'strategy', 'notes'}
+
+
+def _date(value, name):
+    if not isinstance(value, str) or not DATE.fullmatch(value):
+        raise ValueError(f'{name} must be YYYY-MM-DD')
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f'{name} is not a valid date') from None
+
+
+def _text(value, name, maximum, required=False):
+    if value is None and not required:
+        return ''
+    if not isinstance(value, str):
+        raise ValueError(f'{name} must be text')
+    value = value.strip()
+    if (required and not value) or len(value) > maximum or '\x00' in value:
+        raise ValueError(f'{name} must be {"non-empty and " if required else ""}at most {maximum} characters without NUL')
+    return value
+
+
+def _amount(value, name, nonnegative=False):
+    if value is None:
+        return None
+    # Strings avoid binary floating-point and JSON number precision surprises.
+    if not isinstance(value, str) or not NUMBER.fullmatch(value):
+        raise ValueError(f'{name} must be a plain decimal string, up to 18 integer and 8 fractional digits')
+    n = Decimal(value)
+    if nonnegative and n < 0:
+        raise ValueError(f'{name} cannot be negative')
+    return format(n, 'f')
+
+
+def validate_trade(data):
+    if not isinstance(data, dict) or set(data) - FIELDS:
+        raise ValueError('trade must be an object with only documented fields')
+    opened = _date(data.get('opened_date'), 'opened_date')
+    closed_raw = data.get('closed_date')
+    closed = None if closed_raw is None else _date(closed_raw, 'closed_date')
+    if closed is not None and closed < opened:
+        raise ValueError('closed_date cannot precede opened_date')
+    symbol = _text(data.get('symbol'), 'symbol', 80, True)
+    direction = data.get('direction')
+    if direction not in ('buy', 'sell'):
+        raise ValueError('direction must be buy or sell')
+    currency = data.get('currency')
+    if not isinstance(currency, str) or not CURRENCY.fullmatch(currency):
+        raise ValueError('currency must be a three-letter uppercase currency code')
+    pnl = _amount(data.get('realized_pnl'), 'realized_pnl')
+    risk = _amount(data.get('planned_risk'), 'planned_risk', nonnegative=True)
+    if closed is None and pnl is not None:
+        raise ValueError('realized_pnl requires closed_date')
+    return {'opened_date': opened.isoformat(), 'closed_date': closed.isoformat() if closed else None,
+            'symbol': symbol, 'direction': direction, 'currency': currency,
+            'realized_pnl': pnl, 'planned_risk': risk,
+            'strategy': _text(data.get('strategy'), 'strategy', 100),
+            'notes': _text(data.get('notes'), 'notes', 10000)}
+
+
+def period_bounds(period, date):
+    anchor = _date(date, 'date')
+    if period == 'daily':
+        start = end = anchor
+    elif period == 'weekly':
+        try:
+            start = anchor - dt.timedelta(days=anchor.weekday())
+            end = start + dt.timedelta(days=6)
+        except OverflowError:
+            raise ValueError('weekly period outside supported date range') from None
+    elif period == 'monthly':
+        start = anchor.replace(day=1)
+        end = anchor.replace(day=calendar.monthrange(anchor.year, anchor.month)[1])
+    else:
+        raise ValueErr
