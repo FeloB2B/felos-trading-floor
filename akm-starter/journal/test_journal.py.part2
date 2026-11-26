@@ -1,0 +1,41 @@
+
+        self.assertEqual(r['notes'], 'Review notes')
+        self.assertIn('not investment advice', r['disclaimer'])
+        self.j.save_review('weekly', '2026-11-29', 'Edited')
+        self.assertEqual(self.j.review('weekly', '2026-11-25')['notes'], 'Edited')
+        self.assertIsNone(self.j.review('daily', '2026-11-25')['notes'])
+        self.assertEqual(self.j.review('monthly', '2026-11-01')['opened_count'], 7)
+        self.assertEqual(self.j.review('daily', '2026-12-01')['by_currency'], {})
+
+    def test_calendar_boundaries(self):
+        self.assertEqual(period_bounds('weekly', '2027-01-01'), ('2026-12-28', '2027-01-03'))
+        self.assertEqual(period_bounds('monthly', '2024-02-10'), ('2024-02-01', '2024-02-29'))
+        self.assertEqual(period_bounds('daily', '2026-11-26'), ('2026-11-26', '2026-11-26'))
+        for period, date in [('yearly', '2026-01-01'), ('daily', '2025-02-29'), ('weekly', '9999-12-31')]:
+            with self.assertRaises(ValueError): period_bounds(period, date)
+
+    def test_database_rejection(self):
+        bad = Path(self.tmp.name) / 'bad.db'
+        with sqlite3.connect(bad) as db: db.execute('create table unrelated(x)')
+        with self.assertRaises(ValueError): Journal(bad)
+        with sqlite3.connect(bad) as db: db.execute('pragma user_version=999')
+        with self.assertRaises(ValueError): Journal(bad)
+
+    def test_cli(self):
+        def invoke(args, input_text=''):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), unittest.mock.patch('sys.stdin', io.StringIO(input_text)):
+                code = main(['--db', str(self.path)] + args)
+            return code, stdout.getvalue(), stderr.getvalue()
+        self.assertEqual(invoke(['add'], json.dumps(trade()))[0], 0)
+        self.assertEqual(json.loads(invoke(['list'])[1])[0]['symbol'], 'XAUUSD')
+        self.assertEqual(invoke(['replace', '1'], json.dumps(trade(notes='edit')))[0], 0)
+        self.assertEqual(json.loads(invoke(['get', '1'])[1])['notes'], 'edit')
+        self.assertEqual(invoke(['save-review', 'daily', '2026-11-26'], '{"notes":"reviewed"}')[0], 0)
+        self.assertEqual(json.loads(invoke(['review', 'daily', '2026-11-26'])[1])['notes'], 'reviewed')
+        self.assertEqual(invoke(['add'], 'not json')[0], 1)
+        self.assertEqual(invoke(['save-review', 'daily', '2026-11-26'], '{"notes":"x","extra":1}')[0], 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
