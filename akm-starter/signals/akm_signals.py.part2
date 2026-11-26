@@ -1,0 +1,72 @@
+
+        cfg = _parse_json(raw)
+        if not isinstance(cfg, dict) or set(cfg) != _RULE_FIELDS:
+            raise ValueError("invalid rules fields")
+        if cfg["status"] != "configured" or cfg["mode"] != "manual_only" or cfg["model_validation"] != "not_validated":
+            raise ValueError("rules not configured or unsafe mode")
+        known = _symbols(cfg["known_instruments"], nonempty=True)
+        proposed = _symbols(cfg["proposed_instruments"])
+        approved = _symbols(cfg["approved_instruments"], nonempty=True)
+        if set(known) & set(proposed) or not set(approved) <= set(known + proposed):
+            raise ValueError("invalid approved instruments")
+        tf = cfg["timeframes"]
+        if (not isinstance(tf, list) or not tf or len(tf) > len(_ALLOWED_TIMEFRAMES)
+                or any(not isinstance(t, str) or t not in _ALLOWED_TIMEFRAMES for t in tf)
+                or len(tf) != len(set(tf))):
+            raise ValueError("invalid timeframes")
+        return Rules(approved, known, proposed, tuple(tf))
+    except (OSError, ValueError, TypeError, RecursionError, OverflowError) as exc:
+        raise ConfigurationError("Rules unavailable, unconfigured or invalid") from exc
+
+
+def secret_from_env(name: str = "AKM_WEBHOOK_SECRET") -> str:
+    secret = os.environ.get(name, "")
+    _check_server_secret(secret)
+    return secret
+
+
+def _check_server_secret(secret: Any) -> bytes:
+    if not isinstance(secret, str):
+        raise ConfigurationError("Server secret is missing or invalid")
+    try:
+        b = secret.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ConfigurationError("Server secret is missing or invalid") from exc
+    if not 32 <= len(b) <= 256 or not secret.strip():
+        raise ConfigurationError("Server secret must be 32-256 UTF-8 bytes; use a cryptographically random value")
+    return b
+
+
+def _store_once(path: str | Path, event_id: str) -> bool:
+    """Atomically claim an event ID. Persistent DB required; no expiry."""
+    if str(path) in ("", ":memory:") or str(path).startswith("file:"):
+        raise ConfigurationError("Use a private persistent SQLite file")
+    try:
+        # Open privately if new; reject symlinks on platforms that support it.
+        flags = os.O_CREAT | os.O_WRONLY | getattr(os, 'O_NONBLOCK', 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError('dedupe path is not a regular file')
+        finally:
+            os.close(fd)
+        with closing(sqlite3.connect(str(path), timeout=10)) as db:
+            with db:
+                db.execute("CREATE TABLE IF NOT EXISTS seen_events (event_id TEXT PRIMARY KEY NOT NULL)")
+                columns = db.execute("PRAGMA table_info(seen_events)").fetchall()
+                if len(columns) != 1 or columns[0][1:4] != ("event_id", "TEXT", 1) or columns[0][5] != 1:
+                    raise sqlite3.DatabaseError("unexpected dedupe schema")
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name='seen_events'").fetchone():
+                    raise sqlite3.DatabaseError('unexpected dedupe trigger')
+                indexes = db.execute('PRAGMA index_list(seen_events)').fetchall()
+                if len(indexes) != 1 or indexes[0][2:5] != (1, 'pk', 0):
+                    raise sqlite3.DatabaseError('unexpected dedupe index')
+                index_name = indexes[0][1].replace('"', '""')
+                key_columns = [r for r in db.execute(f'PRAGMA index_xinfo("{index_name}")') if r[5]]
+                if len(key_columns) != 1 or key_columns[0][2] != 'event_id' or key_columns[0][4] != 'BINARY':
+                    raise sqlite3.DatabaseError('unexpected dedupe collation')
+                cursor = db.execute("INSERT OR IGNORE INTO seen_events(event_id) VALUES (?)", (event_id,))
+                inserted = cursor.rowcount == 1
+       
