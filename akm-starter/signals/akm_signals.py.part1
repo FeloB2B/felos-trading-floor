@@ -1,0 +1,105 @@
+"""Offline-only AKM shared configuration and untrusted alert intake.
+
+No network listener, broker connection, market data or order placement exists here.
+"""
+from __future__ import annotations
+
+import hmac
+import json
+from contextlib import closing
+import os
+import re
+import sqlite3
+import stat
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+MAX_BODY_BYTES = 16_384
+MAX_RULES_BYTES = 32_768
+_EVENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
+_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9._-]{0,31}\Z", re.ASCII)
+_ALLOWED_TIMEFRAMES = frozenset({"1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"})
+_FIELDS = frozenset({"secret", "event_id", "strategy", "symbol", "timeframe", "direction", "observed_at"})
+_RULE_FIELDS = frozenset({"status", "mode", "model_validation", "known_instruments", "proposed_instruments", "approved_instruments", "timeframes"})
+
+
+class ConfigurationError(ValueError):
+    """Missing, unsafe, unconfigured or malformed local configuration."""
+
+
+class IntakeError(ValueError):
+    """Reject safely; code is intended for callers, never includes payload/secret."""
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def _object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _invalid_constant(_: str) -> None:
+    raise ValueError("non-finite JSON number")
+
+
+def _parse_json(raw: bytes) -> Any:
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=_object_pairs,
+                      parse_constant=_invalid_constant)
+
+
+@dataclass(frozen=True)
+class Rules:
+    approved_instruments: tuple[str, ...]
+    known_instruments: tuple[str, ...]
+    proposed_instruments: tuple[str, ...]
+    timeframes: tuple[str, ...]
+    mode: str = "manual_only"
+    model_validation: str = "not_validated"
+
+
+def _symbols(value: Any, *, nonempty: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, list) or (nonempty and not value) or len(value) > 100:
+        raise ValueError("invalid instrument list")
+    if any(not isinstance(s, str) or not _SYMBOL.fullmatch(s) for s in value):
+        raise ValueError("invalid symbol")
+    if len(value) != len(set(value)):
+        raise ValueError("duplicate symbol")
+    return tuple(value)
+
+
+def _check_rules(rules: Any) -> None:
+    """Reject unsafe or malformed Rules, including directly constructed objects."""
+    try:
+        if not isinstance(rules, Rules) or rules.mode != 'manual_only' or rules.model_validation != 'not_validated':
+            raise ValueError
+        if not all(isinstance(v, tuple) for v in (rules.known_instruments, rules.proposed_instruments,
+                                                 rules.approved_instruments, rules.timeframes)):
+            raise ValueError
+        known = _symbols(list(rules.known_instruments), nonempty=True)
+        proposed = _symbols(list(rules.proposed_instruments))
+        approved = _symbols(list(rules.approved_instruments), nonempty=True)
+        if set(known) & set(proposed) or not set(approved) <= set(known + proposed):
+            raise ValueError
+        tf = rules.timeframes
+        if (not tf or len(tf) > len(_ALLOWED_TIMEFRAMES)
+                or any(not isinstance(t, str) or t not in _ALLOWED_TIMEFRAMES for t in tf)
+                or len(tf) != len(set(tf))):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ConfigurationError('Load valid manual-only configured rules first') from None
+
+
+def load_rules(path: str | Path) -> Rules:
+    """Read an explicitly configured rules file; never silently activate template."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(MAX_RULES_BYTES + 1)
+        if len(raw) > MAX_RULES_BYTES:
+            raise ValueError("rules file too large")
