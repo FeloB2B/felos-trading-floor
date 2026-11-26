@@ -1,0 +1,80 @@
+              obj = dict(self.event, secret=val)
+                self.rejects(obj, code="unauthorized")
+        obj = dict(self.event)
+        del obj["secret"]
+        self.rejects(obj, code="unauthorized")
+        self.assertFalse(self.db.exists())
+        self.assertEqual(self.call()["status"], "accepted_unverified")
+
+    def test_dedupe_persistent_and_no_secret_returned(self):
+        r = self.call()
+        self.assertEqual(r["status"], "accepted_unverified")
+        self.assertTrue(r["manual_review_required"])
+        self.assertNotIn(SECRET, json.dumps(r))
+        self.assertEqual(self.call()["status"], "duplicate")
+        altered = dict(self.event, symbol="TEST_B")
+        self.assertEqual(self.call(altered)["status"], "duplicate")
+        altered["event_id"] = "second"
+        self.assertEqual(self.call(altered)["status"], "accepted_unverified")
+        self.assertNotIn(SECRET.encode(), self.db.read_bytes())
+
+    def test_global_atomic_dedupe_under_race(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(lambda _: self.call()["status"], range(20)))
+        self.assertEqual(results.count("accepted_unverified"), 1)
+        self.assertEqual(results.count("duplicate"), 19)
+
+    def test_invalid_body(self):
+        for data in (b"", b"x" * (akm.MAX_BODY_BYTES + 1), b"\xff", b"[]", b"{", b'{"secret":"a","secret":"b"}', b'{"n":NaN}'):
+            with self.subTest(body=data[:30]):
+                self.rejects(body=data)
+        self.assertFalse(self.db.exists())
+
+    def test_invalid_fields_do_not_consume_id(self):
+        bad = [("event_id", "bad space"), ("event_id", "x" * 129), ("event_id", 1),
+               ("strategy", "bad strategy!"), ("symbol", "TEST_C"), ("symbol", "TEST_Dx"),
+               ("timeframe", "5m"), ("direction", "buy"), ("observed_at", "2026-11-26T10:00:00"),
+               ("observed_at", "nonsense"), ("observed_at", 42)]
+        for key, value in bad:
+            with self.subTest(key=key, value=value):
+                self.rejects(dict(self.event, **{key: value}))
+        extra = dict(self.event, extra="no")
+        self.rejects(extra)
+        missing = dict(self.event)
+        del missing["event_id"]
+        self.rejects(missing)
+        self.assertFalse(self.db.exists())
+        self.assertEqual(self.call()["status"], "accepted_unverified")
+
+    def test_valid_timeframes_directions_and_proposed_approval(self):
+        for i, tf in enumerate(("15m", "1h", "4h", "1d")):
+            r = self.call(dict(self.event, event_id="e%d" % i, timeframe=tf, symbol="TEST_D", direction="short", observed_at="2026-11-26T08:00:00Z"))
+            self.assertEqual(r["status"], "accepted_unverified")
+        self.assertIn("TEST_D", self.rules.proposed_instruments)
+
+    def test_storage_failure_fails_closed(self):
+        self.rejects(code="dedupe_unavailable", db=self.path.parent / "missing" / "db")
+        with self.assertRaises(akm.ConfigurationError):
+            self.call(db=":memory:")
+        self.assertEqual(self.call()["status"], "accepted_unverified")
+
+    def test_incompatible_dedupe_schema_fails_closed(self):
+        db = sqlite3.connect(self.db)
+        try:
+            with db:
+                db.execute("CREATE TABLE seen_events(event_id TEXT)")
+        finally:
+            db.close()
+        self.rejects(code="dedupe_unavailable")
+
+    def test_constructed_rules_are_checked_before_storage(self):
+        from dataclasses import replace
+        cases = [replace(self.rules, mode='automatic'),
+                 replace(self.rules, model_validation='validated'),
+                 replace(self.rules, approved_instruments=('UNKNOWN',)),
+                 replace(self.rules, timeframes=('bogus',)),
+                 replace(self.rules, known_instruments=('TEST_A', 'TEST_A'))]
+        for rules in cases:
+            with self.subTest(rules=rules), self.assertRaises(akm.ConfigurationError):
+                self.call(rules=rules)
+        self.assertFa
