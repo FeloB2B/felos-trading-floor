@@ -1,0 +1,64 @@
+ing trades can appear in both.
+        opened = [dict(r) for r in self.db.execute('SELECT * FROM trades WHERE opened_date BETWEEN ? AND ? ORDER BY opened_date,id', (start, end))]
+        closed = [dict(r) for r in self.db.execute('SELECT * FROM trades WHERE closed_date BETWEEN ? AND ? ORDER BY closed_date,id', (start, end))]
+        notes = self.db.execute('SELECT notes FROM reviews WHERE period=? AND start_date=?', (period, start)).fetchone()
+        by_currency = {}
+        with localcontext() as ctx:
+            ctx.prec = 80
+            for r in opened:
+                s = by_currency.setdefault(r['currency'], {'opened': 0, 'planned_risk_recorded': 0, 'planned_risk_missing': 0, 'planned_risk_total': Decimal(0), 'closed': 0, 'pnl_recorded': 0, 'pnl_missing': 0, 'realized_pnl_total': Decimal(0), 'wins': 0, 'losses': 0, 'flat': 0})
+                s['opened'] += 1
+                if r['planned_risk'] is None:
+                    s['planned_risk_missing'] += 1
+                else:
+                    s['planned_risk_recorded'] += 1
+                    s['planned_risk_total'] += Decimal(r['planned_risk'])
+            for r in closed:
+                s = by_currency.setdefault(r['currency'], {'opened': 0, 'planned_risk_recorded': 0, 'planned_risk_missing': 0, 'planned_risk_total': Decimal(0), 'closed': 0, 'pnl_recorded': 0, 'pnl_missing': 0, 'realized_pnl_total': Decimal(0), 'wins': 0, 'losses': 0, 'flat': 0})
+                s['closed'] += 1
+                if r['realized_pnl'] is None:
+                    s['pnl_missing'] += 1
+                else:
+                    p = Decimal(r['realized_pnl'])
+                    s['pnl_recorded'] += 1
+                    s['realized_pnl_total'] += p
+                    s['wins' if p > 0 else 'losses' if p < 0 else 'flat'] += 1
+        for s in by_currency.values():
+            # Zero records is unknown, not a measured zero.
+            s['planned_risk_total'] = format(s['planned_risk_total'], 'f') if s['planned_risk_recorded'] else None
+            s['realized_pnl_total'] = format(s['realized_pnl_total'], 'f') if s['pnl_recorded'] else None
+        return {'period': period, 'start_date': start, 'end_date': end, 'notes': notes['notes'] if notes else None,
+                'opened_count': len(opened), 'closed_count': len(closed),
+                'by_currency': dict(sorted(by_currency.items())), 'opened_trades': opened,
+                'closed_trades': closed, 'disclaimer': DISCLAIMER}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Local manual AKM journal; never connects to a broker.')
+    parser.add_argument('--db', required=True, help='Local SQLite file path')
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('add', help='Read a complete trade JSON object from stdin')
+    update = sub.add_parser('replace', help='Replace one trade from JSON stdin')
+    update.add_argument('id', type=int)
+    get = sub.add_parser('get'); get.add_argument('id', type=int)
+    sub.add_parser('list')
+    for cmd in ('review', 'save-review'):
+        p = sub.add_parser(cmd)
+        p.add_argument('period', choices=['daily', 'weekly', 'monthly'])
+        p.add_argument('date', help='Any date within period, YYYY-MM-DD')
+    args = parser.parse_args(argv)
+    try:
+        with Journal(args.db) as j:
+            if args.command == 'add':
+                out = {'id': j.add_trade(json.load(sys.stdin))}
+            elif args.command == 'replace':
+                j.replace_trade(args.id, json.load(sys.stdin)); out = {'updated': args.id}
+            elif args.command == 'get':
+                out = j.get_trade(args.id)
+            elif args.command == 'list':
+                out = j.list_trades()
+            elif args.command == 'save-review':
+                value = json.load(sys.stdin)
+                if not isinstance(value, dict) or set(value) != {'notes'}:
+                    raise ValueError('expected JSON object with only notes')
+                j.save_rev
