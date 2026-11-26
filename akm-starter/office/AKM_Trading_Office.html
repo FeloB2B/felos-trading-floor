@@ -1,10 +1,68 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AKM quote office</title>
-<style>body{font:16px system-ui;background:#101827;color:#e8eef8;max-width:900px;margin:3rem auto;padding:0 1rem}h1{color:#72d9c3}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:.8rem;border-bottom:1px solid #34445a}#status{padding:1rem;background:#202c3d}small{color:#b3c0d0}button{padding:.6rem 1rem}</style></head>
+<style>body{font:16px system-ui;background:#101827;color:#e8eef8;max-width:900px;margin:3rem auto;padding:0 1rem}h1{color:#72d9c3}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:.8rem;border-bottom:1px solid #34445a}#status{padding:1rem;background:#202c3d}small{color:#b3c0d0}button{padding:.6rem 1rem}a{color:#86ddf7}#fed-items li{margin:.7rem 0}</style></head>
 <body><h1>AKM</h1><h2>Local read-only quote office</h2><p>This starter shows quotes only when the local MT5 permission and freshness checks pass. It does not place trades.</p><p id="status" role="status">Checking bridge…</p><button id="refresh">Refresh</button><table><thead><tr><th>Market</th><th>State</th><th>Bid</th><th>Ask</th><th>Tick (UTC)</th></tr></thead><tbody id="quotes"></tbody></table><p><small>Journal and signal validation are separate modules, not connected to this page. Prices may be unavailable, delayed or inaccurate. Verify independently before making decisions.</small></p>
+<section aria-labelledby="fed-heading"><h2 id="fed-heading">Periodic Federal Reserve policy headlines</h2><p><small>From the Federal Reserve monetary policy press RSS feed; not comprehensive market news. Checked every 15 minutes while this page is open.</small></p><p id="fed-status" role="status">Checking Federal Reserve feed…</p><button id="fed-refresh">Refresh policy headlines</button><ul id="fed-items"></ul></section>
 <script>
 const status=document.getElementById('status'), rows=document.getElementById('quotes');
 function cell(tr,text){const td=document.createElement('td');td.textContent=text ?? '—';tr.appendChild(td)}
-async function refresh(){try{const r=await fetch('/quotes',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();status.textContent=d.message || 'Status unavailable';rows.replaceChildren();for(const q of d.quotes || []){const tr=document.createElement('tr');for(const v of [q.market,q.state+(q.reason?' — '+q.reason:''),q.bid,q.ask,q.tick_time_utc])cell(tr,v);rows.appendChild(tr)}}catch(e){status.textContent='Bridge unavailable. Start the local bridge and refresh.';rows.replaceChildren()}}
-document.getElementById('refresh').addEventListener('click',refresh);refresh();setInterval(refresh,15000);
+let generation=0, controller=null, expiry=null;
+function clear(message){rows.replaceChildren();status.textContent=message}
+function invalidate(message){generation++;if(controller)controller.abort();controller=null;if(expiry)clearTimeout(expiry);expiry=null;clear(message)}
+async function refresh(){
+  invalidate('Checking bridge…');
+  if(document.hidden){clear('Quotes hidden while this tab is inactive.');return}
+  const mine=generation, request=new AbortController();controller=request;
+  const timeout=setTimeout(()=>request.abort(),5000);
+  try{
+    const r=await fetch('/quotes',{cache:'no-store',signal:request.signal});
+    if(!r.ok)throw Error('HTTP '+r.status);
+    const d=await r.json();
+    if(mine!==generation||document.hidden||request.signal.aborted)return;
+    const now=Date.now();let expiresIn=15000;
+    for(const q of d.quotes || []){
+      if(q.state==='fresh'){
+        const tick=Date.parse(q.tick_time_utc);
+        if(!Number.isFinite(tick)||now-tick>120000||tick-now>5000||!Number.isFinite(q.bid)||!Number.isFinite(q.ask)||q.bid<=0||q.ask<q.bid){q.state='unavailable';q.reason='Invalid or expired quote.';delete q.bid;delete q.ask}
+        else expiresIn=Math.min(expiresIn,Math.max(0,120000-(now-tick)));
+      }else{delete q.bid;delete q.ask}
+    }
+    status.textContent=d.message || 'Status unavailable';
+    for(const q of d.quotes || []){const tr=document.createElement('tr');for(const v of [q.market,q.state+(q.reason?' — '+q.reason:''),q.bid,q.ask,q.tick_time_utc])cell(tr,v);rows.appendChild(tr)}
+    expiry=setTimeout(()=>{if(mine===generation)invalidate('Quotes expired. Refresh to check again.')},expiresIn);
+  }catch(e){if(mine===generation)invalidate('Bridge unavailable or timed out. Refresh to try again.')}
+  finally{clearTimeout(timeout);if(mine===generation)controller=null}
+}
+const fedStatus=document.getElementById('fed-status'), fedItems=document.getElementById('fed-items');
+let fedGeneration=0, fedController=null;
+function validFedLink(value){
+  try{const u=new URL(value);return u.protocol==='https:' && ['federalreserve.gov','www.federalreserve.gov'].includes(u.hostname) && !u.username && !u.password && (!u.port || u.port==='443') && !/[\x00-\x20\x7f]/.test(value)}catch(_){return false}
+}
+async function refreshFed(){
+  const mine=++fedGeneration;if(fedController)fedController.abort();
+  const request=new AbortController();fedController=request;
+  fedItems.replaceChildren();fedStatus.textContent='Checking Federal Reserve feed…';
+  const timeout=setTimeout(()=>request.abort(),10000);
+  try{
+    const r=await fetch('/fed-headlines',{cache:'no-store',signal:request.signal});
+    if(!r.ok)throw Error('HTTP error');const d=await r.json();
+    if(mine!==fedGeneration)return;
+    const times='Feed time: '+(d.feed_time || 'not provided')+'; checked (UTC): '+(d.checked_at_utc || 'unknown')+'.';
+    if(d.error){fedStatus.textContent=d.error+' '+times;return}
+    let count=0;
+    for(const item of Array.isArray(d.items)?d.items:[]){
+      if(typeof item.link!=='string'||typeof item.title!=='string'||!validFedLink(item.link))continue;
+      const li=document.createElement('li'), a=document.createElement('a'), t=document.createElement('small');
+      a.href=item.link;a.target='_blank';a.rel='noopener noreferrer';a.textContent=item.title;
+      t.textContent=' — Published: '+(item.published || 'not provided');li.appendChild(a);li.appendChild(t);fedItems.appendChild(li);count++;
+    }
+    fedStatus.textContent=times+(count?'':' No valid headlines available.');
+  }catch(_){if(mine===fedGeneration)fedStatus.textContent='Federal Reserve headlines unavailable or timed out. Refresh to try again.'}
+  finally{clearTimeout(timeout);if(mine===fedGeneration)fedController=null}
+}
+document.getElementById('fed-refresh').addEventListener('click',refreshFed);
+refreshFed();setInterval(()=>{if(!document.hidden)refreshFed()},900000);
+document.addEventListener('visibilitychange',()=>{invalidate('Quotes cleared while this tab was inactive.');if(!document.hidden)refresh()});
+window.addEventListener('pageshow',()=>refresh());
+document.getElementById('refresh').addEventListener('click',refresh);refresh();setInterval(()=>{if(!document.hidden)refresh()},15000);
 </script></body></html>
