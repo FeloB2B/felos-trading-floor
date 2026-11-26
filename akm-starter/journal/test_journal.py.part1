@@ -1,0 +1,72 @@
+import contextlib
+import io
+import json
+from pathlib import Path
+import sqlite3
+import tempfile
+import unittest
+from unittest import mock
+
+from akm_journal import Journal, main, period_bounds, validate_trade
+
+ROOT = Path(__file__).resolve().parent
+
+
+def trade(**changes):
+    data = {'opened_date': '2026-11-23', 'closed_date': '2026-11-26', 'symbol': 'XAUUSD',
+            'direction': 'buy', 'currency': 'USD', 'realized_pnl': '25.10',
+            'planned_risk': '10.50', 'strategy': 'example', 'notes': 'Manual entry'}
+    data.update(changes)
+    return data
+
+
+class JournalTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.path = Path(self.tmp.name) / 'journal.sqlite'
+        self.j = Journal(self.path)
+
+    def tearDown(self):
+        self.j.close()
+        self.tmp.cleanup()
+
+    def test_persistence_replace_and_missing(self):
+        id1 = self.j.add_trade(trade())
+        self.j.replace_trade(id1, trade(realized_pnl='-5.00', notes='corrected'))
+        self.assertEqual(self.j.get_trade(id1)['realized_pnl'], '-5.00')
+        self.assertEqual(self.j.list_trades()[0]['notes'], 'corrected')
+        with Journal(self.path) as another:
+            self.assertEqual(another.get_trade(id1)['notes'], 'corrected')
+        with self.assertRaises(ValueError): self.j.get_trade(999)
+        with self.assertRaises(ValueError): self.j.replace_trade(999, trade())
+        with self.assertRaises(ValueError): self.j.get_trade(True)
+
+    def test_validation_fails_without_writes(self):
+        cases = [trade(opened_date='2026-02-30'), trade(opened_date='2026-1-01'),
+                 trade(closed_date='2026-11-22'), trade(closed_date=None),
+                 trade(realized_pnl=1.0), trade(realized_pnl='NaN'), trade(realized_pnl='1e4'),
+                 trade(realized_pnl='1.123456789'), trade(realized_pnl='1000000000000000000'),
+                 trade(planned_risk='-1'), trade(currency='usd'), trade(currency='USDD'),
+                 trade(symbol='  '), trade(direction='short'), trade(notes='x' * 10001),
+                 trade(surprise='x')]
+        for data in cases:
+            with self.subTest(data=data), self.assertRaises(ValueError): self.j.add_trade(data)
+        self.assertEqual(self.j.list_trades(), [])
+        self.assertIsNone(validate_trade(trade(closed_date=None, realized_pnl=None))['closed_date'])
+
+    def test_review_separate_cohorts_currencies_missing_and_decimal(self):
+        self.j.add_trade(trade(opened_date='2026-11-22', closed_date='2026-11-23', realized_pnl='0.1', planned_risk='3'))
+        self.j.add_trade(trade(opened_date='2026-11-23', closed_date='2026-11-25', realized_pnl='0.2', planned_risk='1.2'))
+        self.j.add_trade(trade(opened_date='2026-11-24', closed_date='2026-11-26', realized_pnl='-0.1', planned_risk=None))
+        self.j.add_trade(trade(opened_date='2026-11-24', closed_date='2026-11-26', realized_pnl='0', planned_risk='0'))
+        self.j.add_trade(trade(opened_date='2026-11-25', closed_date='2026-11-26', realized_pnl=None, planned_risk=None, currency='ZAR'))
+        self.j.add_trade(trade(opened_date='2026-11-27', closed_date=None, realized_pnl=None, planned_risk='3'))
+        self.j.add_trade(trade(opened_date='2026-11-30', closed_date=None, realized_pnl=None, planned_risk=None))
+        self.j.save_review('weekly', '2026-11-26', 'Review notes')
+        r = self.j.review('weekly', '2026-11-23')
+        self.assertEqual((r['start_date'], r['end_date']), ('2026-11-23', '2026-11-29'))
+        self.assertEqual((r['opened_count'], r['closed_count']), (5, 5))
+        usd, zar = r['by_currency']['USD'], r['by_currency']['ZAR']
+        self.assertEqual((usd['realized_pnl_total'], usd['wins'], usd['losses'], usd['flat']), ('0.2', 2, 1, 1))
+        self.assertEqual((usd['planned_risk_total'], usd['planned_risk_missing']), ('4.2', 1))
+        self.assertEqual((zar['pnl_missing'], zar['realized_pnl_total'], zar['planned_risk_total']), (1, None, None))
