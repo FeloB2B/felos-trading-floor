@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AKM quote office</title>
+<style>body{font:16px system-ui;background:#101827;color:#e8eef8;max-width:900px;margin:3rem auto;padding:0 1rem}h1{color:#72d9c3}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:.8rem;border-bottom:1px solid #34445a}#status{padding:1rem;background:#202c3d}small{color:#b3c0d0}button{padding:.6rem 1rem}</style></head>
+<body><h1>AKM</h1><h2>Local read-only quote office</h2><p>This starter shows quotes only when the local MT5 permission and freshness checks pass. It does not place trades.</p><p id="status" role="status">Checking bridge…</p><button id="refresh">Refresh</button><table><thead><tr><th>Market</th><th>State</th><th>Bid</th><th>Ask</th><th>Tick (UTC)</th></tr></thead><tbody id="quotes"></tbody></table><p><small>Journal and signal validation are separate modules, not connected to this page. Prices may be unavailable, delayed or inaccurate. Verify independently before making decisions.</small></p>
+<script>
+const status=document.getElementById('status'), rows=document.getElementById('quotes');
+function cell(tr,text){const td=document.createElement('td');td.textContent=text ?? '—';tr.appendChild(td)}
+async function refresh(){try{const r=await fetch('/quotes',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();status.textContent=d.message || 'Status unavailable';rows.replaceChildren();for(const q of d.quotes || []){const tr=document.createElement('tr');for(const v of [q.market,q.state+(q.reason?' — '+q.reason:''),q.bid,q.ask,q.tick_time_utc])cell(tr,v);rows.appendChild(tr)}}catch(e){status.textContent='Bridge unavailable. Start the local bridge and refresh.';rows.replaceChildren()}}
+document.getElementById('refresh').addEventListener('click',refresh);refresh();setInterval(refresh,15000);
+</script></body></html>
