@@ -1,0 +1,52 @@
+ return inserted
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        raise IntakeError("dedupe_unavailable") from exc
+
+
+def intake(body: bytes, *, server_secret: str, rules: Rules, dedupe_db: str | Path) -> dict[str, Any]:
+    """Validate/authenticate and persist an ID, returning an unverified candidate.
+
+    The caller must load_rules() before invoking and provide raw bounded request bytes.
+    Results never contain the secret. No market or trading assertion is made.
+    """
+    expected = _check_server_secret(server_secret)
+    _check_rules(rules)
+    if not isinstance(body, bytes) or not body or len(body) > MAX_BODY_BYTES:
+        raise IntakeError("invalid_request")
+    try:
+        obj = _parse_json(body)
+    except (ValueError, UnicodeError, RecursionError):
+        raise IntakeError("invalid_request") from None
+    if not isinstance(obj, dict):
+        raise IntakeError("invalid_request")
+    supplied = obj.get("secret")
+    try:
+        supplied_bytes = supplied.encode("utf-8") if isinstance(supplied, str) else b""
+    except UnicodeEncodeError:
+        supplied_bytes = b""
+    # Always execute a constant-time comparison, including missing/wrong-type secrets.
+    if not hmac.compare_digest(expected, supplied_bytes):
+        raise IntakeError("unauthorized")
+    if set(obj) != _FIELDS:
+        raise IntakeError("invalid_request")
+    event_id, symbol, tf = obj["event_id"], obj["symbol"], obj["timeframe"]
+    if not isinstance(event_id, str) or not _EVENT_ID.fullmatch(event_id):
+        raise IntakeError("invalid_request")
+    if (not isinstance(obj["strategy"], str) or not _EVENT_ID.fullmatch(obj["strategy"]) or not isinstance(symbol, str) or symbol not in rules.approved_instruments
+            or not isinstance(tf, str) or tf not in rules.timeframes or obj["direction"] not in ("long", "short")):
+        raise IntakeError("invalid_request")
+    stamp = obj["observed_at"]
+    if not isinstance(stamp, str) or len(stamp) > 64:
+        raise IntakeError("invalid_request")
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("timezone required")
+    except (ValueError, OverflowError):
+        raise IntakeError("invalid_request") from None
+    if not _store_once(dedupe_db, event_id):
+        return {"status": "duplicate", "event_id": event_id}
+    return {"status": "accepted_unverified", "event_id": event_id,
+            "strategy": obj["strategy"], "symbol": symbol, "timeframe": tf,
+            "direction": obj["direction"], "observed_at": stamp,
+            "manual_review_required": True}
