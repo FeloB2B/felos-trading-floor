@@ -1,0 +1,22 @@
+lse(self.db.exists())
+
+    def test_dedupe_rejects_nocase_and_triggers(self):
+        with sqlite3.connect(self.db) as db:
+            db.execute('CREATE TABLE seen_events (event_id TEXT COLLATE NOCASE PRIMARY KEY NOT NULL)')
+        self.rejects(code='dedupe_unavailable')
+        self.db.unlink()
+        with sqlite3.connect(self.db) as db:
+            db.execute('CREATE TABLE seen_events (event_id TEXT PRIMARY KEY NOT NULL)')
+            db.execute('CREATE TRIGGER bad AFTER INSERT ON seen_events BEGIN DELETE FROM seen_events; END')
+        self.rejects(code='dedupe_unavailable')
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW unavailable")
+    def test_db_symlink_rejected(self):
+        target = Path(self.tmp.name) / "target"
+        target.touch()
+        self.db.symlink_to(target)
+        self.rejects(code="dedupe_unavailable")
+
+
+if __name__ == "__main__":
+    unittest.main()
