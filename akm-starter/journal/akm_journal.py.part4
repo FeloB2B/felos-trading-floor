@@ -1,0 +1,12 @@
+iew(args.period, args.date, value['notes']); out = {'saved': True}
+            else:
+                out = j.review(args.period, args.date)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    except (ValueError, sqlite3.Error, OSError, json.JSONDecodeError) as e:
+        print('Journal error: ' + str(e), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
