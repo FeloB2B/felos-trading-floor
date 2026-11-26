@@ -13,7 +13,7 @@ def fake(names=('XAUUSDm', 'US30', 'USTECm', 'US500m')):
     mt = Mock()
     mt.initialize.return_value = True
     mt.terminal_info.return_value = NS(connected=True)
-    mt.account_info.return_value = NS(trade_allowed=False, login=123456, password='secret')
+    mt.account_info.return_value = NS(trade_allowed=False, login=123456, server='TEST-SERVER', password='secret')
     mt.symbols_get.return_value = [NS(name=x) for x in names]
     mt.symbol_select.return_value = True
     mt.symbol_info_tick.return_value = NS(time=int(NOW), time_msc=1700000000123, bid=2300.5, ask=2300.7)
@@ -55,10 +55,24 @@ class BridgeTests(unittest.TestCase):
         self.assertNotIn('secret', json.dumps(self.b.quotes()))
 
     def test_changes_account_during_collection(self):
-        self.mt.account_info.side_effect = [NS(trade_allowed=False), NS(trade_allowed=True)]
+        self.mt.account_info.side_effect = [NS(trade_allowed=False, login=123456, server='TEST-SERVER'), NS(trade_allowed=True)]
         result = self.b.quotes()
         self.assertFalse(result['connected'])
         self.assertEqual(result['quotes'], [])
+
+    def test_switch_between_read_only_accounts_and_missing_identity(self):
+        first = NS(trade_allowed=False, login=123456, server='TEST-SERVER')
+        for second in (NS(trade_allowed=False, login=222222, server='TEST-SERVER'),
+                       NS(trade_allowed=False, login=123456, server='OTHER-SERVER'),
+                       NS(trade_allowed=False), NS(trade_allowed=False, login=True, server='s')):
+            with self.subTest(account=second):
+                mt = fake()
+                mt.account_info.side_effect = [first, second]
+                result = bridge.Bridge(mt, lambda: NOW).quotes()
+                self.assertFalse(result['connected'])
+                self.assertEqual(result['quotes'], [])
+                self.assertNotIn('123456', json.dumps(result))
+                self.assertNotIn('TEST-SERVER', json.dumps(result))
 
     def test_ambiguous_and_leveraged_do_not_match(self):
         self.mt = fake(['XAUUSD','XAUUSDm','US30x','USTEC3L','US500m'])
@@ -118,6 +132,10 @@ class HttpTests(unittest.TestCase):
     def test_reject_untrusted_and_arbitrary_paths(self):
         self.assertEqual(self.request('GET','/quotes',{'Host':'evil.test:8765'})[0],403)
         self.assertEqual(self.request('GET','/quotes',{'Origin':'https://evil.test'})[0],403)
+        self.assertEqual(self.request('GET','/quotes',{'Origin':''})[0],403)
+        self.assertEqual(self.request('GET','/quotes',{'Sec-Fetch-Site':'cross-site'})[0],403)
+        self.assertEqual(self.request('GET','/quotes',{'Sec-Fetch-Site':'same-site'})[0],403)
+        self.assertEqual(self.request('GET','/quotes',{'Sec-Fetch-Site':'same-origin'})[0],200)
         self.assertEqual(self.request('GET','/bridge.py')[0],404)
         self.assertEqual(self.request('GET','/quotes?password=secret')[0],404)
         self.assertEqual(self.request('POST','/quotes')[0],501)
