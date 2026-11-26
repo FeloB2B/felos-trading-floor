@@ -1,3 +1,5 @@
+> **First run:** The journal and signals source files are stored in numbered text parts. Run `python prepare_sources.py` from this folder before running their tests or using those components. The parts will be reassembled locally.
+
 # AKM trading office — public starter
 
 A local, early-stage starter, **not a deployed or complete trading system**. Three independent components share a repository but are not connected to each other:
